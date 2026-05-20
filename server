@@ -1,0 +1,206 @@
+#include <windows.h>
+#include <iostream>
+#include <string>
+#include <fstream>
+using namespace std;
+
+HANDLE g_hPipe = INVALID_HANDLE_VALUE;
+HANDLE g_hEvent = NULL;
+
+void CreateNamedPipe() {
+    string name;
+    cout << "Введите имя канала: ";
+    cin >> name;
+    string pipeName = "\\\\.\\pipe\\" + name;
+
+    g_hPipe = CreateNamedPipeA(
+        pipeName.c_str(),
+        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE,
+        1, 0, 0,
+        NMPWAIT_USE_DEFAULT_WAIT,
+        NULL
+    );
+
+    if (g_hPipe == INVALID_HANDLE_VALUE) {
+        cout << "Ошибка создания канала: " << GetLastError() << endl;
+        return;
+    }
+
+    char path[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, path);
+    string filePath = string(path) + "\\..\\PipeNames.txt";
+
+    ofstream file(filePath);
+    if (file.is_open()) {
+        file << pipeName << endl;
+        file.close();
+        cout << "Файл создан: " << filePath << endl;
+    }
+    else {
+        cout << "Ошибка создания файла!" << endl;
+    }
+
+    cout << "Канал создан: " << pipeName << endl;
+}
+
+void Connect() {
+    if (g_hPipe == INVALID_HANDLE_VALUE) {
+        cout << "Сначала создайте канал!" << endl;
+        return;
+    }
+
+    if (g_hEvent == NULL) {
+        g_hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (g_hEvent == NULL) {
+            cout << "Ошибка создания события: " << GetLastError() << endl;
+            return;
+        }
+    }
+
+    OVERLAPPED overlapped = { 0 };
+    overlapped.hEvent = g_hEvent;
+
+    cout << "Ожидание подключения клиента..." << endl;
+    BOOL result = ConnectNamedPipe(g_hPipe, &overlapped);
+
+    if (!result) {
+        DWORD error = GetLastError();
+        if (error == ERROR_IO_PENDING) {
+            DWORD waitResult = WaitForSingleObject(g_hEvent, 30000);
+            if (waitResult == WAIT_OBJECT_0) {
+                cout << "Клиент подключен!" << endl;
+            }
+            else {
+                cout << "Таймаут ожидания!" << endl;
+                CancelIo(g_hPipe);
+            }
+        }
+        else if (error == ERROR_PIPE_CONNECTED) {
+            cout << "Клиент уже был подключен!" << endl;
+        }
+        else {
+            cout << "Ошибка подключения: " << error << endl;
+        }
+    }
+    else {
+        cout << "Клиент подключен мгновенно!" << endl;
+    }
+}
+
+void Disconnect() {
+    if (g_hPipe == INVALID_HANDLE_VALUE) {
+        cout << "Канал не создан!" << endl;
+        return;
+    }
+
+    if (DisconnectNamedPipe(g_hPipe)) {
+        cout << "Соединение разорвано!" << endl;
+    }
+    else {
+        cout << "Ошибка отключения: " << GetLastError() << endl;
+    }
+}
+
+void CreateEvent() {
+    g_hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (g_hEvent == NULL) {
+        cout << "Ошибка создания события: " << GetLastError() << endl;
+        return;
+    }
+    cout << "Событие создано!" << endl;
+}
+
+void AsyncWrite() {
+    if (g_hPipe == INVALID_HANDLE_VALUE) {
+        cout << "Канал не создан!" << endl;
+        return;
+    }
+
+    if (g_hEvent == NULL) {
+        cout << "Событие не создано!" << endl;
+        return;
+    }
+
+    string data;
+    cout << "Введите данные для отправки: ";
+    cin.ignore();
+    getline(cin, data);
+
+    OVERLAPPED overlapped = { 0 };
+    overlapped.hEvent = g_hEvent;
+
+    DWORD bytesWritten;
+    BOOL result = WriteFile(g_hPipe, data.c_str(), data.size(), &bytesWritten, &overlapped);
+
+    if (!result) {
+        DWORD error = GetLastError();
+        if (error == ERROR_IO_PENDING) {
+            cout << "Асинхронная запись запущена. Используйте пункт 6 для ожидания." << endl;
+        }
+        else {
+            cout << "Ошибка записи: " << error << endl;
+        }
+    }
+    else {
+        cout << "Данные записаны мгновенно! Байт: " << bytesWritten << endl;
+    }
+}
+
+void WaitForIO() {
+    if (g_hEvent == NULL) {
+        cout << "Событие не создано!" << endl;
+        return;
+    }
+
+    cout << "Ожидание завершения операции..." << endl;
+    DWORD waitResult = WaitForSingleObject(g_hEvent, 60000);
+
+    if (waitResult == WAIT_OBJECT_0) {
+        cout << "Операция завершена!" << endl;
+    }
+    else if (waitResult == WAIT_TIMEOUT) {
+        cout << "Таймаут ожидания!" << endl;
+    }
+    else {
+        cout << "Ошибка ожидания: " << GetLastError() << endl;
+    }
+}
+
+int main() {
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+    setlocale(LC_ALL, "ru_RU.UTF-8");
+
+    cout << "Сервер именованного канала" << endl;
+
+    int ans;
+    while (true) {
+        cout << "\nМЕНЮ:" << endl;
+        cout << "1. Создать именованный канал" << endl;
+        cout << "2. Установить соединение" << endl;
+        cout << "3. Отключить соединение" << endl;
+        cout << "4. Создать объект \"событие\"" << endl;
+        cout << "5. Ввод данных и асинхронная запись в канал" << endl;
+        cout << "6. Ожидание завершения операции ввода/вывода" << endl;
+        cout << "0. Выход" << endl;
+        cout << "Выбор: ";
+        cin >> ans;
+
+        switch (ans) {
+        case 1: CreateNamedPipe(); break;
+        case 2: Connect(); break;
+        case 3: Disconnect(); break;
+        case 4: CreateEvent(); break;
+        case 5: AsyncWrite(); break;
+        case 6: WaitForIO(); break;
+        case 0:
+            if (g_hPipe != INVALID_HANDLE_VALUE) CloseHandle(g_hPipe);
+            if (g_hEvent != NULL) CloseHandle(g_hEvent);
+            remove("PipeNames.txt");
+            return 0;
+        default:
+            cout << "Неверный выбор!" << endl;
+        }
+    }
+}
