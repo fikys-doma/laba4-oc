@@ -1,288 +1,270 @@
-#pragma comment (lib, "winmm.lib")
-#include "windows.h"
-#include <iostream>
-#include "fstream"
-#include "time.h"
-#include <iomanip>
-#include <string>
-#include <fcntl.h>
-#include <io.h>
+// Отключаем предупреждения компилятора о небезопасных функциях (scanf, sprintf и т.д.)
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>   // Главная библиотека Windows API
+#include <cstdio>      // Для функций вывода (printf, sprintf)
+#include <cstdlib>     // Для общих утилит (rand, srand)
+#include <ctime>       // Для работы со временем (time)
+#include <mmsystem.h>  // Мультимедийная библиотека, нужна для функции timeGetTime()
+#include <cstring>     // Для функций работы со строками (strcmp, strlen)
 
-using namespace std;
+// Говорим линковщику подключить библиотеку winmm.lib (для timeGetTime)
+#pragma comment(lib, "winmm.lib")
 
-// Глобальные дескрипторы объектов синхронизации
-HANDLE mutex;           // Мьютекс для защиты счетчика активных читателей
-HANDLE wrt;            // Семафор для управления доступом писателей (1 - свободен, 0 - занят)
-HANDLE* pageMutexes;   // Массив мьютексов для блокировки отдельных страниц буфера
-int readCount = 0;     // Количество читателей, активных в данный момент
+// --- Структура, которая будет находиться в самом начале разделяемой памяти ---
+// Это как "заголовок" нашего общего файла.
+struct SharedBuffer {
+    volatile LONG initDone;         // Флаг инициализации. 0 - еще не готово, 1 - готово.
+                                    // volatile означает, что значение может измениться в любой момент другим процессом.
+    volatile LONG pageReadCount[1]; // Массив счетчиков читателей для каждой страницы.
+                                    // На самом деле это "гибкий массив" - его размер будет PageCount.
+                                    // Написан как [1] для удобства объявления, реально памяти выделится больше.
+};
 
-// Количество страниц буферной памяти
-// Вычисляется как сумма цифр номера студенческого билета без первой цифры
-const int pages = 3 + 0 + 7 + 1 + 2;
+// --- Глобальные переменные ---
+SharedBuffer* pBuffer = nullptr;   // Указатель на начало разделяемой памяти (на структуру SharedBuffer)
+SIZE_T PageSize = 0;               // Размер одной страницы памяти (обычно 4096 байт)
+SIZE_T TotalBufferSize = 0;        // Общий размер разделяемой памяти
+int PageCount = 0;                 // Количество страниц, с которыми работаем
+HANDLE* hPageMutexes = nullptr;    // Массив мьютексов, по одному на каждую страницу. Защищают доступ к странице.
+HANDLE hGlobalMutex = nullptr;     // Глобальный мьютекс для защиты счетчиков читателей (pageReadCount)
 
-/*
- * Функция инициализации буферной памяти через проецируемый файл
- * Параметры:
- *   buffSize - размер буфера в байтах
- *   isReader - признак процесса-читателя (true) или писателя (false)
- * Возвращает:
- *   Указатель на отображенную область памяти
- */
-LPVOID initBuffer(int buffSize, bool isReader) {
-    // Создаем или открываем файл для буфера
-    HANDLE file = CreateFileA(
-        "buffer.dat",                                     // Имя файла в текущей директории
-        GENERIC_READ | GENERIC_WRITE,                     // Доступ на чтение и запись
-        FILE_SHARE_READ | FILE_SHARE_WRITE,               // Разрешаем общий доступ
-        NULL,                                             // Атрибуты безопасности по умолчанию
-        isReader ? OPEN_EXISTING : CREATE_ALWAYS,         // Открыть или создать файл
-        FILE_ATTRIBUTE_NORMAL,                            // Обычный файл
-        NULL                                              // Без шаблона
-    );
-
-    if (file == INVALID_HANDLE_VALUE) {
-        cout << "Ошибка создания/открытия файла. Код ошибки: " << GetLastError() << endl;
-        exit(1);
+// --- Вспомогательная функция для записи в лог-файл ---
+void WriteLog(const char* role, DWORD pid, const char* state, int page) {
+    char filename[128];
+    // Выбираем папку для логов в зависимости от роли
+    const char* dir = (strcmp(role, "WRITER") == 0) ? "writer_logs" : "reader_logs";
+    // Создаем папку, если ее еще нет (функция из Windows API)
+    CreateDirectoryA(dir, NULL);
+    // Формируем имя файла: "папка\РОЛЬ_PID.log"
+    sprintf(filename, "%s\\%s_%lu.log", dir, role, pid);
+    // Открываем файл для добавления в конец ("a" - append)
+    FILE* f = fopen(filename, "a");
+    if (f) {
+        // Записываем время в миллисекундах и состояние
+        fprintf(f, "[%10lu] %-35s", timeGetTime(), state);
+        // Если указана страница (не -1), добавляем ее номер
+        if (page >= 0) fprintf(f, " Page: %d", page);
+        fprintf(f, "\n");
+        fclose(f);
     }
-
-    // Пытаемся открыть существующий проецируемый файл
-    HANDLE buffer = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "SharedBuffer");
-    if (buffer == NULL) {
-        buffer = CreateFileMappingA(
-            file,                 // Файл для отображения
-            NULL,                 // Атрибуты безопасности
-            PAGE_READWRITE,       // Доступ на чтение и запись
-            0,                    // Старшие 32 бита размера
-            buffSize,            // Младшие 32 бита размера
-            "SharedBuffer"       // Имя объекта в пространстве имен ядра
-        );
-
-        if (buffer == NULL) {
-            cout << "Ошибка создания проецируемого файла. Код ошибки: " << GetLastError() << endl;
-            CloseHandle(file);
-            exit(1);
-        }
-    }
-
-    // Отображаем файл в адресное пространство процесса
-    LPVOID buffAddress = MapViewOfFile(
-        buffer,                   // Объект проецируемого файла
-        FILE_MAP_ALL_ACCESS,      // Полный доступ
-        0, 0,                     // Смещение от начала файла
-        buffSize                  // Размер отображения
-    );
-
-    if (buffAddress == NULL) {
-        cout << "Ошибка отображения файла в память. Код ошибки: " << GetLastError() << endl;
-        CloseHandle(buffer);
-        CloseHandle(file);
-        exit(1);
-    }
-
-    // Блокируем страницы буфера в оперативной памяти
-    if (!VirtualLock(buffAddress, buffSize)) {
-        cout << "Ошибка блокировки памяти. Код ошибки: " << GetLastError() << endl;
-    }
-    else {
-        cout << "Страницы буфера заблокированы в ОЗУ" << endl;
-    }
-
-    // Закрываем дескриптор файла (отображение остается активным)
-    CloseHandle(file);
-    return buffAddress;
 }
 
-/*
- * Функция инициализации объектов синхронизации
- * Создает или открывает существующие мьютексы и семафоры
- */
-void initSyncObjects() {
-    // Мьютекс для защиты счетчика активных читателей
-    mutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "ReaderCountMutex");
-    if (mutex == NULL) {
-        mutex = CreateMutexA(NULL, FALSE, "ReaderCountMutex");
-    }
-
-    // Семафор для писателей
-    wrt = OpenSemaphoreA(SEMAPHORE_ALL_ACCESS, FALSE, "WriterSemaphore");
-    if (wrt == NULL) {
-        wrt = CreateSemaphoreA(NULL, 1, 1, "WriterSemaphore");
-    }
-
-    // Создаем массив мьютексов для каждой страницы буфера
-    pageMutexes = new HANDLE[pages];
-    for (int i = 0; i < pages; i++) {
-        string name = "PageMutex_" + to_string(i);
-        pageMutexes[i] = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, name.c_str());
-        if (pageMutexes[i] == NULL) {
-            pageMutexes[i] = CreateMutexA(NULL, FALSE, name.c_str());
-        }
-    }
-    cout << "Объекты синхронизации инициализированы" << endl;
-}
-
-/*
- * Функция записи состояния в журнальный файл
- */
-void journalState(fstream& journal, const char* state, int page = -1) {
-    journal << setw(10) << GetCurrentProcessId() << " | "
-        << setw(10) << timeGetTime() << " | "
-        << setw(15) << state << " | ";
-    if (page >= 0) {
-        journal << setw(10) << page;
-    }
-    journal << endl;
-}
-
+// --- Главная функция ---
 int main(int argc, char* argv[]) {
-    // Настройка консоли для корректного отображения русского языка
-    // Используем UTF-8 как в рабочем примере
-    SetConsoleCP(65001);
-    SetConsoleOutputCP(65001);
-    setlocale(LC_ALL, ".UTF8");
-
-    // Очистка экрана консоли
-    system("cls");
-
-    // Инициализация генератора случайных чисел
-    srand((unsigned int)time(NULL));
-
-    // Получаем системную информацию для определения размера страницы
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    const int pageSize = sysInfo.dwPageSize;
-    const int buffSize = pageSize * pages;
-
-    // Определяем тип процесса по аргументу командной строки
-    bool isReader = (argc > 1 && strcmp(argv[1], "reader") == 0);
-    cout << (isReader ? "ПРОЦЕСС ЧИТАТЕЛЬ" : "ПРОЦЕСС ПИСАТЕЛЬ") << endl;
-    cout << "Количество страниц: " << pages << endl;
-    cout << "Размер страницы: " << pageSize << " байт" << endl;
-    cout << "Общий размер буфера: " << buffSize << " байт" << endl;
-
-    // Выделяем локальный буфер для операций чтения/записи
-    char* localBuffer = new char[pageSize];
-    if (!isReader) {
-        // Писатель заполняет буфер случайным символом
-        memset(localBuffer, 97 + rand() % 26, pageSize);
+    // Проверяем аргументы командной строки. Должно быть 2: роль (reader/writer) и номер билета.
+    if (argc < 3) {
+        printf("Usage: %s <reader|writer> <ticket_number>\n", argv[0]);
+        printf("Example: %s writer 12345\n", argv[0]);
+        printf("Example: %s reader 12345\n", argv[0]);
+        system("pause");
+        return 1;
     }
 
-    // Инициализация буферной памяти и объектов синхронизации
-    LPVOID buffAddress = initBuffer(buffSize, isReader);
-    initSyncObjects();
+    // Определяем роль процесса
+    bool isWriter = (strcmp(argv[1], "writer") == 0);
+    const char* role = isWriter ? "WRITER" : "READER";
+    DWORD pid = GetCurrentProcessId(); // Получаем ID текущего процесса
 
-    // Открываем журнальный файл для записи состояний
-    fstream journal;
-    journal.open(isReader ? "ReaderJournal.txt" : "WriterJournal.txt",
-        ios::app | ios::out);
+    // Инициализируем генератор случайных чисел. Используем время и ID процесса для уникальности.
+    srand((unsigned int)time(NULL) ^ pid);
 
-    // Заголовок новой сессии в журнале
-    journal << "\nНовая сессия начата в " << timeGetTime() << endl;
-    journal << setw(10) << "ID ПРОЦЕССА" << " | "
-        << setw(10) << "ВРЕМЯ" << " | "
-        << setw(15) << "СОСТОЯНИЕ" << " | "
-        << setw(10) << "СТРАНИЦА" << endl;
-
-    cout << setw(25) << "АДРЕС" << " | "
-        << setw(10) << "СТРАНИЦА" << endl;
-
-    // Основной цикл работы процесса
-    while (true) {
-        if (isReader) {
-            // Логика работы читателя
-
-            // Записываем начало ожидания доступа
-            journalState(journal, "Ожидание");
-
-            // Выбираем случайную страницу для чтения
-            int targetPage = rand() % pages;
-
-            // Вход читателя: увеличиваем счетчик активных читателей
-            WaitForSingleObject(mutex, INFINITE);
-            readCount++;
-            if (readCount == 1) {
-                // Первый читатель блокирует писателей
-                WaitForSingleObject(wrt, INFINITE);
-            }
-            ReleaseMutex(mutex);
-
-            // Блокируем выбранную страницу для эксклюзивного доступа
-            WaitForSingleObject(pageMutexes[targetPage], INFINITE);
-
-            // Выполняем чтение данных со страницы
-            journalState(journal, "Начало чтения", targetPage);
-
-            // Вычисляем адрес страницы правильно для 64-битных систем
-            char* pageAddress = (char*)buffAddress + (size_t)targetPage * pageSize;
-            cout << setw(20) << (void*)pageAddress
-                << " | " << setw(10) << targetPage << endl;
-
-            // Копируем данные из разделяемой памяти в локальный буфер
-            memcpy(localBuffer, pageAddress, pageSize);
-
-            // Имитация длительности операции чтения: 500-1500 мс
-            Sleep(500 + rand() % 1000);
-
-            journalState(journal, "Конец чтения", targetPage);
-
-            // Освобождаем страницу
-            ReleaseMutex(pageMutexes[targetPage]);
-
-            // Выход читателя: уменьшаем счетчик активных читателей
-            WaitForSingleObject(mutex, INFINITE);
-            readCount--;
-            if (readCount == 0) {
-                // Последний читатель освобождает писателей
-                ReleaseSemaphore(wrt, 1, NULL);
-            }
-            ReleaseMutex(mutex);
-
-            // Записываем состояние освобождения ресурсов
-            journalState(journal, "Освобождение");
-
-        }
-        else {
-            // Логика работы писателя
-
-            // Записываем начало ожидания доступа
-            journalState(journal, "Ожидание");
-
-            // Выбираем случайную страницу для записи
-            int targetPage = rand() % pages;
-
-            // Ждем освобождения семафора писателей
-            WaitForSingleObject(wrt, INFINITE);
-
-            // Блокируем выбранную страницу
-            WaitForSingleObject(pageMutexes[targetPage], INFINITE);
-
-            // Выполняем запись данных на страницу
-            journalState(journal, "Начало записи", targetPage);
-
-            // Вычисляем адрес страницы правильно для 64-битных систем
-            char* pageAddress = (char*)buffAddress + (size_t)targetPage * pageSize;
-            cout << setw(20) << (void*)pageAddress
-                << " | " << setw(10) << targetPage << endl;
-
-            // Копируем данные из локального буфера в разделяемую память
-            memcpy(pageAddress, localBuffer, pageSize);
-
-            // Имитация длительности операции записи: 500-1500 мс
-            Sleep(500 + rand() % 1000);
-
-            journalState(journal, "Конец записи", targetPage);
-
-            // Освобождаем страницу и семафор писателей
-            ReleaseMutex(pageMutexes[targetPage]);
-            ReleaseSemaphore(wrt, 1, NULL);
-
-            // Записываем состояние освобождения ресурсов
-            journalState(journal, "Освобождение");
+    // --- Вычисляем количество страниц на основе номера билета ---
+    // Номер билета — это строка, например "12345".
+    char* ticket = argv[2];
+    PageCount = 0;
+    // Суммируем все цифры в номере билета
+    for (int i = 1; ticket[i] != '\0'; i++) { // Начинаем с 1, вероятно, чтобы пропустить первую цифру? Не совсем понятно, но логика такая.
+        if (ticket[i] >= '0' && ticket[i] <= '9') {
+            PageCount += (ticket[i] - '0'); // Преобразуем символ цифры в число и добавляем к сумме
         }
     }
+    // Если сумма цифр равна 0 (например, билет "0"), делаем хотя бы 1 страницу.
+    if (PageCount == 0) PageCount = 1;
 
-    // Освобождение ресурсов (недостижимо в бесконечном цикле)
-    delete[] localBuffer;
-    journal.close();
+    printf("[%s PID:%lu] Ticket: %s, Pages: %d\n", role, pid, ticket, PageCount);
+
+    // --- Определяем размер страницы и общий размер буфера ---
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);       // Получаем системную информацию
+    PageSize = si.dwPageSize; // Размер страницы виртуальной памяти (стандартно 4096 байт)
+
+    // Вычисляем общий размер разделяемой памяти:
+    // Размер структуры SharedBuffer (без учета гибкого массива) +
+    // (PageCount * sizeof(LONG)) для счетчиков читателей +
+    // (PageCount * PageSize) для самих данных страниц.
+    // offsetof(SharedBuffer, pageReadCount) — это смещение поля pageReadCount в структуре, то есть размер части структуры ДО этого поля.
+    TotalBufferSize = offsetof(SharedBuffer, pageReadCount) + PageCount * sizeof(LONG) + PageCount * PageSize;
+
+    // --- Создаем мьютексы для каждой страницы ---
+    hPageMutexes = new HANDLE[PageCount]; // Выделяем память под массив "ручек" мьютексов
+    for (int i = 0; i < PageCount; i++) {
+        wchar_t name[64];
+        // Формируем уникальное имя для каждого мьютекса: "Global\PageMutex_0", "Global\PageMutex_1" и т.д.
+        swprintf(name, 64, L"Global\\PageMutex_%d", i);
+        // Создаем или открываем существующий мьютекс.
+        // NULL — безопасность по умолчанию, FALSE — начальное состояние "не занят", name — имя.
+        hPageMutexes[i] = CreateMutexW(NULL, FALSE, name);
+    }
+
+    // Создаем глобальный мьютекс для защиты массива счетчиков pageReadCount
+    hGlobalMutex = CreateMutexW(NULL, FALSE, L"Global\\ReaderCountMutex");
+    // Создаем мьютекс для одноразовой инициализации разделяемой памяти
+    HANDLE hMutexInit = CreateMutexW(NULL, FALSE, L"Global\\InitMutex");
+
+    // --- Создаем или открываем разделяемую память (File Mapping) ---
+    // Пытаемся открыть существующий объект разделяемой памяти с именем "Local\SharedMemory"
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, L"Local\\SharedMemory");
+    bool first = false; // Флаг, который покажет, мы ли создали память
+    if (!hMap) { // Если открыть не удалось (память еще не создана)
+        // Создаем новый объект разделяемой памяти.
+        // INVALID_HANDLE_VALUE - память не связана с файлом на диске.
+        // PAGE_READWRITE - разрешаем чтение и запись.
+        // 0, (DWORD)TotalBufferSize - размер памяти (старшая и младшая части 64-битного числа).
+        hMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)TotalBufferSize, L"Local\\SharedMemory");
+        first = true; // Мы первые, кто создал этот объект
+    }
+
+    // Отображаем разделяемую память в адресное пространство нашего процесса.
+    // pBuffer теперь указывает на начало этой общей памяти.
+    pBuffer = (SharedBuffer*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    // "Запираем" страницы в физической памяти, чтобы они не были выгружены на диск (для надежности и скорости).
+    VirtualLock(pBuffer, TotalBufferSize);
+
+    // --- Инициализация разделяемой памяти (только один раз) ---
+    // Захватываем мьютекс инициализации, чтобы только один процесс мог инициализировать данные.
+    WaitForSingleObject(hMutexInit, INFINITE);
+    // Если мы создали память (first == true) ИЛИ память не была проинициализирована другим процессом.
+    if (first || !pBuffer->initDone) {
+        if (first) { // Только если мы создатели, обнуляем все счетчики и заполняем страницы начальными данными.
+            // Обнуляем счетчики читателей для каждой страницы
+            for (int i = 0; i < PageCount; i++) {
+                pBuffer->pageReadCount[i] = 0;
+            }
+            // Вычисляем указатель на начало данных страниц
+            char* pagesStart = (char*)pBuffer + offsetof(SharedBuffer, pageReadCount) + PageCount * sizeof(LONG);
+            // Заполняем каждую страницу текстом "Page_0", "Page_1" и т.д.
+            for (int i = 0; i < PageCount; i++) {
+                snprintf(pagesStart + i * PageSize, PageSize, "Page_%d", i);
+            }
+            // Атомарно устанавливаем флаг завершения инициализации в 1.
+            InterlockedExchange(&pBuffer->initDone, 1);
+        }
+        // Если first == false, но initDone == 0, это означает, что создатель по какой-то причине не дошел до инициализации.
+        // В этом простом примере мы просто ждем. Более сложная логика могла бы доинициализировать, но здесь не требуется.
+    }
+    ReleaseMutex(hMutexInit); // Освобождаем мьютекс инициализации
+
+    // Случайным образом выбираем страницу для работы
+    int page = rand() % PageCount;
+    // Вычисляем указатель на начало области данных для всех страниц
+    char* pagesStart = (char*)pBuffer + offsetof(SharedBuffer, pageReadCount) + PageCount * sizeof(LONG);
+
+    // ====== ЛОГИКА ПИСАТЕЛЯ ======
+    if (isWriter) {
+        WriteLog(role, pid, "WAIT_START", page); // Запись в лог: начал ждать
+
+        DWORD waitStart = timeGetTime(); // Засекаем время начала ожидания
+        // Захватываем мьютекс конкретной страницы. Писатель ждет, пока освободится.
+        WaitForSingleObject(hPageMutexes[page], INFINITE);
+        DWORD waitEnd = timeGetTime(); // Засекаем время конца ожидания
+
+        // Если пришлось ждать больше 0 мс, пишем в лог время ожидания
+        if (waitEnd > waitStart) {
+            char msg[64];
+            sprintf(msg, "WAIT_MUTEX_%lums", waitEnd - waitStart);
+            WriteLog(role, pid, msg, page);
+        }
+
+        // Если на этой странице есть активные читатели, ждем, пока они все уйдут.
+        if (pBuffer->pageReadCount[page] > 0) {
+            WriteLog(role, pid, "WAIT_READERS", page);
+            while (pBuffer->pageReadCount[page] > 0) Sleep(10); // Ждем в цикле с маленькой паузой
+        }
+
+        WriteLog(role, pid, "WRITE", page); // Запись в лог: начинаю писать
+
+        // Формируем данные для записи: "Writer_<PID>"
+        char data[64];
+        snprintf(data, sizeof(data), "Writer_%lu", pid);
+        // Копируем данные в соответствующую страницу разделяемой памяти
+        memcpy(pagesStart + page * PageSize, data, strlen(data) + 1);
+
+        // Имитируем длительную работу по записи (от 500 до 1500 мс)
+        DWORD sleepTime = 500 + rand() % 1001;
+        printf("[%s PID:%lu] Writing page %d (%lums)...\n", role, pid, page, sleepTime);
+        Sleep(sleepTime);
+
+        WriteLog(role, pid, "RELEASE", page); // Запись в лог: освобождаю
+        // Освобождаем мьютекс страницы, разрешая другим работать с ней
+        ReleaseMutex(hPageMutexes[page]);
+    }
+    // ====== ЛОГИКА ЧИТАТЕЛЯ ======
+    else {
+        WriteLog(role, pid, "WAIT_START", page); // Запись в лог: начал ждать
+
+        // Захватываем глобальный мьютекс, чтобы безопасно изменить счетчик читателей
+        WaitForSingleObject(hGlobalMutex, INFINITE);
+        // Атомарно увеличиваем счетчик читателей на выбранной странице
+        LONG newCount = InterlockedIncrement(&pBuffer->pageReadCount[page]);
+
+        // Если это ПЕРВЫЙ читатель на этой странице (newCount стал равен 1)
+        if (newCount == 1) {
+            WriteLog(role, pid, "FIRST_READER_LOCK", page);
+            DWORD waitStart = timeGetTime();
+            // Первый читатель блокирует мьютекс страницы, чтобы писатель не мог начать писать.
+            WaitForSingleObject(hPageMutexes[page], INFINITE);
+            DWORD waitEnd = timeGetTime();
+            // Логируем время ожидания мьютекса, если оно было
+            if (waitEnd > waitStart) {
+                char msg[64];
+                sprintf(msg, "WAIT_MUTEX_%lums", waitEnd - waitStart);
+                WriteLog(role, pid, msg, page);
+            }
+        }
+        ReleaseMutex(hGlobalMutex); // Освобождаем глобальный мьютекс
+
+        WriteLog(role, pid, "READ", page); // Запись в лог: начинаю читать
+
+        // Копируем данные со страницы в локальный буфер
+        char buf[256];
+        memcpy(buf, pagesStart + page * PageSize, 255);
+        buf[255] = '\0'; // Гарантируем завершающий ноль
+        printf("[%s PID:%lu] Page %d: %s\n", role, pid, page, buf);
+
+        // Имитируем процесс чтения (500-1500 мс)
+        DWORD sleepTime = 500 + rand() % 1001;
+        printf("[%s PID:%lu] Reading page %d (%lums)...\n", role, pid, page, sleepTime);
+        Sleep(sleepTime);
+
+        // Захватываем глобальный мьютекс для безопасного уменьшения счетчика читателей
+        WaitForSingleObject(hGlobalMutex, INFINITE);
+        // Атомарно уменьшаем счетчик читателей на странице
+        LONG remainCount = InterlockedDecrement(&pBuffer->pageReadCount[page]);
+        // Если это был ПОСЛЕДНИЙ читатель (remainCount стал равен 0)
+        if (remainCount == 0) {
+            WriteLog(role, pid, "LAST_READER_UNLOCK", page);
+            // Последний читатель освобождает мьютекс страницы, давая возможность писателю работать.
+            ReleaseMutex(hPageMutexes[page]);
+        }
+        ReleaseMutex(hGlobalMutex);
+        WriteLog(role, pid, "RELEASE", -1); // -1 означает, что страница не важна для этой записи
+    }
+
+    // --- Очистка ресурсов ---
+    // Закрываем все мьютексы страниц
+    for (int i = 0; i < PageCount; i++) {
+        CloseHandle(hPageMutexes[i]);
+    }
+    delete[] hPageMutexes; // Освобождаем массив указателей
+    CloseHandle(hGlobalMutex);
+    CloseHandle(hMutexInit);
+
+    // Разблокируем страницы и убираем отображение разделяемой памяти из нашего адресного пространства
+    VirtualUnlock(pBuffer, TotalBufferSize);
+    UnmapViewOfFile(pBuffer);
+    CloseHandle(hMap); // Закрываем сам объект разделяемой памяти
+
+    printf("[%s PID:%lu] Done.\n", role, pid);
+    system("pause"); // Ждем нажатия клавиши перед закрытием окна
     return 0;
 }
