@@ -1,93 +1,97 @@
-// Подключаем заголовочные файлы (библиотеки)
-#include <windows.h> // Главная библиотека Windows API (содержит все нужные функции для каналов, событий и т.д.)
-#include <vector>    // Для хранения списка каналов
-#include <iostream>  // Для ввода и вывода в консоль (cin, cout)
-#include <fstream>   // Для работы с файлами (читаем файл со списком каналов)
-#include <string>    // Для работы со строками
-using namespace std; // Пространство имен std, чтобы не писать везде std::cout, std::string и т.д.
+#include <windows.h>
+#include <vector>
+#include <iostream>
+#include <fstream>
+#include <string>
+using namespace std;
 
-// Глобальные переменные для хранения важных объектов
-HANDLE g_hPipe = INVALID_HANDLE_VALUE; // "Ручка" канала. Изначально недействительна.
-HANDLE g_hEvent = NULL;                // "Ручка" события. Нужна для асинхронных операций.
+// Глобальные переменные
+HANDLE g_hPipe = INVALID_HANDLE_VALUE; //хранение дескриптор открытого именованного канала
+HANDLE g_hEvent = NULL;
+
+BOOL g_bReadCompleted = FALSE;
+DWORD g_dwBytesRead = 0;         // Сколько байт реально прочитано
+char g_buffer[1024] = { 0 };     // Глобальный буфер для чтения
+
+VOID CALLBACK ReadCompletionRoutine(
+    DWORD dwErrorCode,
+    DWORD dwNumberOfBytesTransfered,
+    LPOVERLAPPED lpOverlapped
+)
+{
+    g_dwBytesRead = dwNumberOfBytesTransfered; // Сохраняем количество прочитанных байт
+    g_bReadCompleted = TRUE;                   // Поднимаем флаг — готово
+
+    // Устанавливаем событие, чтобы разбудить основной поток,
+    // если он ждёт на WaitForSingleObjectEx
+    if (g_hEvent != NULL) {
+        SetEvent(g_hEvent);
+    }
+}
 
 // --- Функция для подключения к выбранному каналу ---
 void ConnectToPipe() {
-    char path[MAX_PATH]; // Буфер для хранения текущего пути (массив символов фиксированного размера)
-    // Получаем полный путь к папке, где запущена наша программа
+    char path[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, path);
-    // Формируем путь к файлу PipeNames.txt. "\\..\\" означает "выйти из текущей папки в родительскую".
-    // Сервер и клиент, видимо, запускаются из разных папок, а файл лежит в общей для них родительской папке.
     string filePath = string(path) + "\\..\\PipeNames.txt";
 
-    // Открываем файл для чтения
     ifstream file(filePath);
-    if (!file.is_open()) { // Проверяем, открылся ли файл
+    if (!file.is_open()) {
         cout << "Файл " << filePath << " не найден!" << endl;
         cout << "Сначала запустите сервер и создайте канал!" << endl;
-        return; // Выходим из функции, подключиться не получится
+        return;
     }
 
-    vector<string> pipes; // Список для хранения имен каналов из файла
-    string pipeName;      // Переменная для временного хранения прочитанного имени
+    vector<string> pipes;
+    string pipeName;
     int i = 1;
 
     cout << "\nДоступные каналы:" << endl;
-    // Читаем файл построчно, пока не кончится
     while (getline(file, pipeName)) {
-        // Игнорируем пустые строки
         if (!pipeName.empty()) {
-            cout << i++ << ". " << pipeName << endl; // Выводим номер и имя канала
-            pipes.push_back(pipeName); // Добавляем имя в вектор
+            cout << i++ << ". " << pipeName << endl;
+            pipes.push_back(pipeName);
         }
     }
-    file.close(); // Закрываем файл
+    file.close();
 
-    if (pipes.empty()) { // Если не прочитали ни одного имени канала
+    if (pipes.empty()) {
         cout << "Нет доступных каналов!" << endl;
         return;
     }
 
-    // Спрашиваем пользователя, к какому каналу подключиться
     cout << "\nВыберите номер канала: ";
     int choice;
     cin >> choice;
 
-    // Проверяем, правильный ли номер ввел пользователь
     if (choice < 1 || choice > pipes.size()) {
         cout << "Неверный номер!" << endl;
         return;
     }
 
-    // Берем выбранное имя канала из вектора
-    string selectedPipe = pipes[choice - 1]; // -1, потому что нумерация в векторе с 0
+    string selectedPipe = pipes[choice - 1];
 
-    // --- Создаем событие, если его еще нет ---
-    // Событие нужно для асинхронного режима работы с каналом.
+    // Создаем событие (нужно для пробуждения потока из callback)
     if (g_hEvent == NULL) {
-        // Параметры:
-        // NULL - атрибуты безопасности по умолчанию
-        // TRUE - событие с ручным сбросом
-        // FALSE - начальное состояние: несигнальное (операция не завершена)
-        // NULL - имя события не задаем
         g_hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (g_hEvent == NULL) { // Если создать не удалось
-            cout << "Ошибка создания события: " << GetLastError() << endl; // Выводим код ошибки
+        if (g_hEvent == NULL) {
+            cout << "Ошибка создания события: " << GetLastError() << endl;
             return;
         }
     }
 
-    // --- Подключаемся к именованному каналу ---
+    // Подключаемся к каналу
     g_hPipe = CreateFileA(
-        selectedPipe.c_str(), // Имя канала в стиле C-строки
-        GENERIC_READ,         // Мы будем только читать из канала
-        0,                    // Нет разделения доступа
-        NULL,                 // Атрибуты безопасности по умолчанию
-        OPEN_EXISTING,        // Открываем только существующий канал
-        FILE_FLAG_OVERLAPPED, // Открываем в режиме асинхронного (перекрывающегося) ввода/вывода
-        NULL                  // Игнорируется для каналов
+        selectedPipe.c_str(),
+        GENERIC_READ,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,   // Асинхронный режим обязателен для ReadFileEx
+        NULL
     );
 
-    if (g_hPipe == INVALID_HANDLE_VALUE) { // Если подключиться не удалось
+    if (g_hPipe == INVALID_HANDLE_VALUE) {
         cout << "Ошибка подключения: " << GetLastError() << endl;
         return;
     }
@@ -95,69 +99,68 @@ void ConnectToPipe() {
     cout << "Подключено к каналу: " << selectedPipe << endl;
 }
 
-// --- Функция для чтения данных из канала ---
+// --- Функция для чтения данных из канала (ReadFileEx + callback) ---
 void ReadData() {
-    if (g_hPipe == INVALID_HANDLE_VALUE) { // Проверяем, подключены ли мы
+    if (g_hPipe == INVALID_HANDLE_VALUE) {
         cout << "Сначала подключитесь к каналу!" << endl;
         return;
     }
 
-    char buffer[1024] = { 0 }; // Буфер для приема данных (массив на 1024 символа, заполнен нулями)
-    DWORD bytesRead = 0;       // Сюда запишется, сколько байт реально прочитано
+    // Сбрасываем флаг и счётчик перед новой операцией
+    g_bReadCompleted = FALSE;
+    g_dwBytesRead = 0;
+    memset(g_buffer, 0, sizeof(g_buffer));
 
-    // Структура для асинхронной операции
-    OVERLAPPED overlapped = { 0 }; // Обнуляем все поля структуры
-    overlapped.hEvent = g_hEvent;   // Связываем структуру с нашим событием
+    // Структура OVERLAPPED. Для ReadFileEx поле hEvent НЕ ИСПОЛЬЗУЕТСЯ.
+    OVERLAPPED overlapped = { 0 };
 
     cout << "Ожидание данных..." << endl;
 
-    // Начинаем асинхронное чтение
-    BOOL result = ReadFile(
-        g_hPipe,                // Из какого канала читаем
-        buffer,                 // В какой буфер
-        sizeof(buffer) - 1,    // Максимальный размер для чтения (минус 1 для '\0')
-        NULL,                   // Количество прочитанных байт НЕ ЗАПОЛНЯЕМ (для асинхронного режима)
-        &overlapped             // Указатель на структуру OVERLAPPED
+    // Запускаем асинхронное чтение с callback-функцией
+    BOOL result = ReadFileEx(
+        g_hPipe,                    // Дескриптор канала
+        g_buffer,
+        sizeof(g_buffer) - 1,
+        &overlapped,
+        ReadCompletionRoutine
     );
 
-    if (!result) { // Если ReadFile вернул FALSE
-        DWORD error = GetLastError(); // Смотрим, какая ошибка
-        // ERROR_IO_PENDING — это не ошибка, а штатное поведение для асинхронного режима. Операция начата и ждёт.
-        if (error == ERROR_IO_PENDING) {
-            cout << "Асинхронное чтение запущено..." << endl;
-            // Ждем завершения операции, но не более 60 секунд (60000 миллисекунд)
-            DWORD waitResult = WaitForSingleObject(g_hEvent, 60000);
+    if (!result) {
+        DWORD error = GetLastError();
+        cout << "Ошибка запуска чтения: " << error << endl;
+        return;
+    }
 
-            if (waitResult == WAIT_OBJECT_0) { // Операция завершена успешно
-                // Получаем результат операции. bytesRead здесь реально заполнится.
-                if (GetOverlappedResult(g_hPipe, &overlapped, &bytesRead, FALSE)) {
-                    buffer[bytesRead] = '\0'; // Добавляем завершающий ноль, чтобы вывести как строку
-                    cout << "Получено " << bytesRead << " байт: " << buffer << endl;
-                }
-            }
-            else if (waitResult == WAIT_TIMEOUT) { // Время вышло
-                cout << "Таймаут ожидания!" << endl;
-                CancelIo(g_hPipe); // Отменяем операцию ввода/вывода для этого канала
-            }
-        }
-        else { // Действительно ошибка
-            cout << "Ошибка чтения: " << error << endl;
+    DWORD waitResult = WaitForSingleObjectEx(g_hEvent, 60000, TRUE);
+
+    if (waitResult == WAIT_OBJECT_0) {
+        if (g_bReadCompleted) {
+            g_buffer[g_dwBytesRead] = '\0';
+            cout << "Получено " << g_dwBytesRead << " байт: " << g_buffer << endl;
         }
     }
-    else { // Если ReadFile вернул TRUE, операция мгновенно завершилась (данные уже были в буфере канала)
-        // Все равно нужно получить результат, чтобы узнать bytesRead
-        if (GetOverlappedResult(g_hPipe, &overlapped, &bytesRead, FALSE)) {
-            buffer[bytesRead] = '\0';
-            cout << "Получено " << bytesRead << " байт: " << buffer << endl;
+    else if (waitResult == WAIT_IO_COMPLETION) {
+        if (g_bReadCompleted) {
+            g_buffer[g_dwBytesRead] = '\0';
+            cout << "Получено " << g_dwBytesRead << " байт: " << g_buffer << endl;
         }
     }
+    else if (waitResult == WAIT_TIMEOUT) {
+        cout << "Таймаут ожидания!" << endl;
+        CancelIo(g_hPipe);
+        g_bReadCompleted = FALSE;
+    }
+    else {
+        cout << "Ошибка ожидания: " << GetLastError() << endl;
+    }
+
+    ResetEvent(g_hEvent);
 }
 
-// --- Функция для отключения от канала ---
 void DisconnectFromPipe() {
-    if (g_hPipe != INVALID_HANDLE_VALUE) { // Если мы подключены
-        CloseHandle(g_hPipe);              // Закрываем "ручку" канала
-        g_hPipe = INVALID_HANDLE_VALUE;    // Сбрасываем значение в "недействительно"
+    if (g_hPipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_hPipe);
+        g_hPipe = INVALID_HANDLE_VALUE;
         cout << "Отключено от канала!" << endl;
     }
     else {
@@ -165,18 +168,15 @@ void DisconnectFromPipe() {
     }
 }
 
-// --- Главная функция клиента ---
 int main() {
-    // Настройка консоли для корректного отображения кириллицы
-    SetConsoleCP(65001);       // Устанавливаем кодировку ввода как UTF-8
-    SetConsoleOutputCP(65001); // Устанавливаем кодировку вывода как UTF-8
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
     setlocale(LC_ALL, "ru_RU.UTF-8");
 
-    cout << "Клиент именованного канала" << endl;
+    cout << "Клиент именованного канала (ReadFileEx + callback)" << endl;
 
-    int ans; // Переменная для выбора пункта меню
-    while (true) { // Бесконечный цикл, пока пользователь не выберет "0"
-        // Выводим меню
+    int ans;
+    while (true) {
         cout << "\nМЕНЮ:" << endl;
         cout << "1. Подключиться к каналу" << endl;
         cout << "2. Прочитать данные" << endl;
@@ -185,18 +185,16 @@ int main() {
         cout << "Выбор: ";
         cin >> ans;
 
-        // Обрабатываем выбор
         switch (ans) {
-        case 1: ConnectToPipe(); break;   // Вызов функции подключения
-        case 2: ReadData(); break;        // Вызов функции чтения
-        case 3: DisconnectFromPipe(); break; // Вызов функции отключения
+        case 1: ConnectToPipe(); break;
+        case 2: ReadData(); break;
+        case 3: DisconnectFromPipe(); break;
         case 0:
-            // Перед выходом корректно освобождаем ресурсы
-            if (g_hPipe != INVALID_HANDLE_VALUE) CloseHandle(g_hPipe); // Закрываем канал, если открыт
-            if (g_hEvent != NULL) CloseHandle(g_hEvent);              // Закрываем событие, если создано
-            return 0; // Завершаем программу
+            if (g_hPipe != INVALID_HANDLE_VALUE) CloseHandle(g_hPipe);
+            if (g_hEvent != NULL) CloseHandle(g_hEvent);
+            return 0;
         default:
-            cout << "Неверный выбор!" << endl; // Если ввели не 0-3
+            cout << "Неверный выбор!" << endl;
         }
     }
 }
