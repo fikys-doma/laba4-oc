@@ -4,36 +4,44 @@
 #include <fstream>
 using namespace std;
 
-HANDLE g_hPipe = INVALID_HANDLE_VALUE;
-HANDLE g_hEvent = NULL;
+// Глобальные переменные
+HANDLE g_hPipe = INVALID_HANDLE_VALUE; //для всех операций (ожидание, запись, отключение)
+HANDLE g_hEvent = NULL;                // "Ручка" события для асинхронных операций
 
+// Функция создания нового именованного канала 
 void CreateNamedPipe() {
-    string name;
+    string name; // Для хранения имени канала, введенного пользователем
     cout << "Введите имя канала: ";
     cin >> name;
+    // Формируем полное имя канала. "\\\\.\\pipe\\" - это обязательный префикс.
     string pipeName = "\\\\.\\pipe\\" + name;
 
+    // Создаем именованный канал
     g_hPipe = CreateNamedPipeA(
-        pipeName.c_str(),
-        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE,
-        1, 0, 0,
-        NMPWAIT_USE_DEFAULT_WAIT,
-        NULL
+        pipeName.c_str(),       // Имя канала
+        PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED, // Направление: только на запись (OUTBOUND) + асинхронный режим
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE,   // Тип: передача сообщениями
+        1,                      // Максимум одновременных клиентов (экземпляров канала)
+        0,                      // Размер выходного буфера (0 — по умолчанию)
+        0,                      // Размер входного буфера
+        NMPWAIT_USE_DEFAULT_WAIT, // Таймаут ожидания по умолчанию
+        NULL                    // Атрибуты безопасности по умолчанию
     );
 
-    if (g_hPipe == INVALID_HANDLE_VALUE) {
+    if (g_hPipe == INVALID_HANDLE_VALUE) { // Если создать канал не удалось
         cout << "Ошибка создания канала: " << GetLastError() << endl;
         return;
     }
 
+    // Сохраняем имя канала в файл, чтобы клиент мог его найти
     char path[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, path);
+    GetCurrentDirectoryA(MAX_PATH, path); // Получаем путь к папке с программой-сервером
+    // Путь к файлу PipeNames.txt (в родительской папке)
     string filePath = string(path) + "\\..\\PipeNames.txt";
 
-    ofstream file(filePath);
+    ofstream file(filePath); // Открываем файл для записи
     if (file.is_open()) {
-        file << pipeName << endl;
+        file << pipeName << endl; // Записываем полное имя канала
         file.close();
         cout << "Файл создан: " << filePath << endl;
     }
@@ -44,13 +52,16 @@ void CreateNamedPipe() {
     cout << "Канал создан: " << pipeName << endl;
 }
 
+// Функция для ожидания подключения клиента
 void Connect() {
-    if (g_hPipe == INVALID_HANDLE_VALUE) {
+    if (g_hPipe == INVALID_HANDLE_VALUE) { // Канал не создан
         cout << "Сначала создайте канал!" << endl;
         return;
     }
 
+    // Создаем событие, если его еще нет
     if (g_hEvent == NULL) {
+        // Параметры: атрибуты безопасности, ручной сброс, начальное несигнальное состояние, без имени
         g_hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (g_hEvent == NULL) {
             cout << "Ошибка создания события: " << GetLastError() << endl;
@@ -58,42 +69,47 @@ void Connect() {
         }
     }
 
+    // Подготавливаем структуру для асинхронной операции
     OVERLAPPED overlapped = { 0 };
-    overlapped.hEvent = g_hEvent;
+    overlapped.hEvent = g_hEvent; // Связываем с событием
 
     cout << "Ожидание подключения клиента..." << endl;
+    // Начинаем асинхронно ждать подключения
     BOOL result = ConnectNamedPipe(g_hPipe, &overlapped);
 
-    if (!result) {
-        DWORD error = GetLastError();
-        if (error == ERROR_IO_PENDING) {
+    if (!result) { // Если ConnectNamedPipe вернул FALSE
+        DWORD error = GetLastError(); // Проверяем код ошибки
+        if (error == ERROR_IO_PENDING) { // Операция начала выполняться асинхронно
+            // Ждем завершения 30 секунд (30000 мс)
             DWORD waitResult = WaitForSingleObject(g_hEvent, 30000);
-            if (waitResult == WAIT_OBJECT_0) {
+            if (waitResult == WAIT_OBJECT_0) { // Событие сработало — клиент подключился
                 cout << "Клиент подключен!" << endl;
             }
             else {
                 cout << "Таймаут ожидания!" << endl;
-                CancelIo(g_hPipe);
+                CancelIo(g_hPipe); // Отменяем операцию
             }
         }
+        // Это не ошибка, а сигнал о том, что клиент подключился до вызова ConnectNamedPipe
         else if (error == ERROR_PIPE_CONNECTED) {
             cout << "Клиент уже был подключен!" << endl;
         }
-        else {
+        else { // Настоящая ошибка
             cout << "Ошибка подключения: " << error << endl;
         }
     }
-    else {
+    else { // ConnectNamedPipe сразу вернул TRUE — клиент подключился мгновенно
         cout << "Клиент подключен мгновенно!" << endl;
     }
 }
 
+// Функция для разрыва соединения с текущим клиентом
 void Disconnect() {
     if (g_hPipe == INVALID_HANDLE_VALUE) {
         cout << "Канал не создан!" << endl;
         return;
     }
-
+    // Разрываем соединение. Канал остается созданным и может ждать нового клиента.
     if (DisconnectNamedPipe(g_hPipe)) {
         cout << "Соединение разорвано!" << endl;
     }
@@ -102,6 +118,7 @@ void Disconnect() {
     }
 }
 
+// Функция для отдельного создания события
 void CreateEvent() {
     g_hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (g_hEvent == NULL) {
@@ -111,12 +128,12 @@ void CreateEvent() {
     cout << "Событие создано!" << endl;
 }
 
+// Функция для асинхронной записи в канал 
 void AsyncWrite() {
     if (g_hPipe == INVALID_HANDLE_VALUE) {
         cout << "Канал не создан!" << endl;
         return;
     }
-
     if (g_hEvent == NULL) {
         cout << "Событие не создано!" << endl;
         return;
@@ -124,37 +141,46 @@ void AsyncWrite() {
 
     string data;
     cout << "Введите данные для отправки: ";
-    cin.ignore();
-    getline(cin, data);
+    cin.ignore(); // Игнорируем символ новой строки, оставшийся в буфере cin после предыдущего ввода
+    getline(cin, data); // Считываем строку целиком (может содержать пробелы)
 
+    // Подготавливаем OVERLAPPED для асинхронной записи
     OVERLAPPED overlapped = { 0 };
     overlapped.hEvent = g_hEvent;
 
-    DWORD bytesWritten;
-    BOOL result = WriteFile(g_hPipe, data.c_str(), data.size(), &bytesWritten, &overlapped);
+    DWORD bytesWritten; // Сюда запишется количество записанных байтов
+    // Начинаем асинхронную запись
+    BOOL result = WriteFile(
+        g_hPipe,        // Куда пишем (в канал)
+        data.c_str(),   // Какие данные (указатель на первый символ строки)
+        data.size(),    // Сколько байт писать
+        &bytesWritten,  // Куда записать количество записанных байт
+        &overlapped     // Структура для асинхронной операции
+    );
 
-    if (!result) {
+    if (!result) { // Если WriteFile вернул FALSE
         DWORD error = GetLastError();
-        if (error == ERROR_IO_PENDING) {
+        if (error == ERROR_IO_PENDING) { // Операция еще не завершена
             cout << "Асинхронная запись запущена. Используйте пункт 6 для ожидания." << endl;
         }
-        else {
+        else { // Ошибка записи
             cout << "Ошибка записи: " << error << endl;
         }
     }
-    else {
+    else { // Данные записались в буфер мгновенно
         cout << "Данные записаны мгновенно! Байт: " << bytesWritten << endl;
     }
 }
 
+// --- Функция для ожидания завершения последней асинхронной операции ---
 void WaitForIO() {
     if (g_hEvent == NULL) {
         cout << "Событие не создано!" << endl;
         return;
     }
-
     cout << "Ожидание завершения операции..." << endl;
-    DWORD waitResult = WaitForSingleObject(g_hEvent, 60000);
+    // Ждем на нашем глобальном событии
+    DWORD waitResult = WaitForSingleObject(g_hEvent, 60000); // Ждем 60 секунд
 
     if (waitResult == WAIT_OBJECT_0) {
         cout << "Операция завершена!" << endl;
@@ -167,7 +193,9 @@ void WaitForIO() {
     }
 }
 
+// --- Главная функция сервера ---
 int main() {
+    // Настраиваем консоль для поддержки русского языка
     SetConsoleCP(65001);
     SetConsoleOutputCP(65001);
     setlocale(LC_ALL, "ru_RU.UTF-8");
@@ -195,8 +223,10 @@ int main() {
         case 5: AsyncWrite(); break;
         case 6: WaitForIO(); break;
         case 0:
+            // Очистка ресурсов перед выходом
             if (g_hPipe != INVALID_HANDLE_VALUE) CloseHandle(g_hPipe);
             if (g_hEvent != NULL) CloseHandle(g_hEvent);
+            // Удаляем файл с именами каналов, так как сервер завершает работу
             remove("PipeNames.txt");
             return 0;
         default:
